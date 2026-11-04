@@ -1,0 +1,135 @@
+"""Two anomaly detectors with the SAME interface:
+
+    detector.fit(normal_images: list[np.ndarray])   # resized BGR images, normal ones only
+    detector.score_map(img_bgr) -> np.ndarray       # float32, shape (H, W) equal to the input image
+    detector.score_range, detector.default_threshold, detector.name
+
+As long as this interface is kept, app.py does not need to change when the internals are replaced.
+
+Optional statistics cache (so the app does not re-estimate statistics on every start):
+    detector.supports_cache = True        # opt in
+    detector.cache_version = "1"          # bump when the saved statistics change meaning
+    detector.save(path)                   # write the fitted statistics to path (a .npz file)
+    detector.load(path)                   # restore them; no fit() needed afterwards
+If supports_cache is False (or missing) the detector is simply fitted on every start.
+"""
+from __future__ import annotations
+
+import cv2
+import numpy as np
+
+
+# ==========================================================================
+# Sobel implemented from scratch (cv2.Sobel is NOT used for the computation)
+# ==========================================================================
+SOBEL_KX = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+SOBEL_KY = SOBEL_KX.T.copy()
+
+
+def conv3x3(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """3x3 correlation with reflected borders (same convention as cv2.Sobel)."""
+    p = np.pad(img, 1, mode="reflect")
+    h, w = img.shape
+    out = np.zeros((h, w), dtype=np.float32)
+    for i in range(3):
+        for j in range(3):
+            out += kernel[i, j] * p[i : i + h, j : j + w]
+    return out
+
+
+def sobel_gray(img_bgr: np.ndarray) -> np.ndarray:
+    """Gaussian-smoothed grayscale image: the input of the Sobel filter."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return cv2.GaussianBlur(gray, (5, 5), 1.0)
+
+
+def sobel_gradients(img_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    g = sobel_gray(img_bgr)
+    gx, gy = conv3x3(g, SOBEL_KX), conv3x3(g, SOBEL_KY)
+    return gx, gy, np.sqrt(gx**2 + gy**2)
+
+
+class SobelDetector:
+    """Candidate score S = |G - mu_G| / (sigma_G + eps), with mu and sigma computed per pixel
+    over aligned normal images. If not fitted yet, a temporary fallback is used (see score_map)."""
+
+    name = "Sobel"
+    score_range = 100.0       # upper end of the threshold sliders (scores on defects can exceed 100)
+    default_threshold = 3.0   # TODO: fix with the normal validation images
+    eps = 1.0                 # numerical-stability constant, TODO: tune on the data
+    is_placeholder = False
+    supports_cache = True     # statistics can be saved/loaded (see save/load below)
+    cache_version = "1"       # bump when the statistics change meaning (e.g. different smoothing)
+
+    def __init__(self) -> None:
+        self.mu: np.ndarray | None = None
+        self.sigma: np.ndarray | None = None
+
+    @property
+    def fitted(self) -> bool:
+        return self.mu is not None
+
+    def fit(self, normal_images: list[np.ndarray]) -> None:
+        g = np.stack([sobel_gradients(im)[2] for im in normal_images])
+        self.mu, self.sigma = g.mean(axis=0), g.std(axis=0)
+
+    def save(self, path: str) -> None:
+        if not self.fitted:
+            raise RuntimeError("Nothing to save: call fit() first.")
+        np.savez(path, mu=self.mu, sigma=self.sigma)
+
+    def load(self, path: str) -> None:
+        with np.load(path) as z:
+            self.mu, self.sigma = z["mu"], z["sigma"]
+
+    def edges(self, img_bgr: np.ndarray) -> np.ndarray:
+        """Raw edge map G (intermediate output, NOT a defect probability)."""
+        return sobel_gradients(img_bgr)[2]
+
+    def score_map(self, img_bgr: np.ndarray) -> np.ndarray:
+        g = self.edges(img_bgr)
+        if self.fitted:
+            s = np.abs(g - self.mu) / (self.sigma + self.eps)
+        else:
+            # Temporary fallback for demos when there are no normal images: normalize G by its own standard deviation.
+            s = g / (float(g.std()) + self.eps)
+        return s.astype(np.float32)
+
+
+# ==========================================================================
+# PaDiM: PLACEHOLDER, to be replaced with the real implementation
+# ==========================================================================
+class PaDiMDetector:
+    """TODO (owners of the ResNet18 feature extractor and of PaDiM):
+
+    fit():       extract ResNet18 features (intermediate layers, dimensionality reduced) from the
+                 normal images; estimate the mean and the regularized covariance at every
+                 spatial position.
+    score_map(): extract features from the test image, compute the Mahalanobis distance at every
+                 position, and resize the result to (H, W) of the input image.
+    save()/load(): optional; see the statistics cache note at the top of this file, then set
+                 supports_cache = True.
+
+    For now it returns an all-zero map so the UI runs end to end; it has no detection meaning yet.
+    """
+
+    name = "PaDiM"
+    score_range = 50.0        # TODO: set from the real Mahalanobis distance distribution
+    default_threshold = 20.0  # TODO: fix with the normal validation images
+    is_placeholder = True
+    supports_cache = False    # TODO: set True once save()/load() below are implemented
+    cache_version = "1"
+
+    def fit(self, normal_images: list[np.ndarray]) -> None:
+        pass  # TODO
+
+    def save(self, path: str) -> None:
+        # TODO: np.savez(path, mean=..., inv_cov=...) with the per-position mean and inverse covariance.
+        raise NotImplementedError
+
+    def load(self, path: str) -> None:
+        # TODO: restore the arrays saved above, then set supports_cache = True on this class.
+        raise NotImplementedError
+
+    def score_map(self, img_bgr: np.ndarray) -> np.ndarray:
+        return np.zeros(img_bgr.shape[:2], dtype=np.float32)  # TODO
