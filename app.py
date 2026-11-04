@@ -60,8 +60,11 @@ st.set_page_config(page_title="DefectVision", layout="wide")
 def load_detectors(normal_dir: str, size: int, max_images: int):
     padim, sobel = PaDiMDetector(), SobelDetector()
     imgs, used = load_normal_images(normal_dir, size, max_images)
+    n_found = len(imgs)
+    if n_found < 2:  # the team's Sobel module needs at least 2 normal images (a standard deviation)
+        imgs, used = [], []
     info = {d.name: fit_or_load(d, imgs, used, size, CACHE_DIR) for d in (padim, sobel)}
-    return padim, sobel, len(imgs), info
+    return padim, sobel, len(imgs), info, n_found
 
 
 def method_controls(det) -> tuple[PostConfig, float]:
@@ -128,7 +131,9 @@ if not normal_dir and category is not None and category.train_good:
 if normal_dir and not os.path.isdir(normal_dir):
     st.sidebar.warning("Normal images folder not found.")
 
-padim, sobel, n_normal, fit_info = load_detectors(normal_dir, int(size), int(max_images))
+padim, sobel, n_normal, fit_info, n_found = load_detectors(normal_dir, int(size), int(max_images))
+if n_found == 1:
+    st.sidebar.warning("Only 1 normal image found. At least 2 are needed to estimate the statistics.")
 detectors = [padim, sobel]
 controls = {d.name: method_controls(d) for d in detectors}
 
