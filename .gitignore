@@ -1,0 +1,48 @@
+# Python 가상환경과 실행 캐시
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 모델 가중치·체크포인트·추출 특징·통계 배열은 로컬에서 관리
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+/feature/*
+!/feature/README.md
+
+# 원본 데이터와 압축파일
+/data/
+/datasets/
+/mvtec/
+/mvtec_ad/
+/mvtec_anomaly_detection/
+/bottle/
+/demo_data/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.xz
+*.xz
+*.7z
+*.rar
+
+# 자동 생성 결과·로그와 로컬 비밀 설정
+stats_cache/
+evaluation_output/
+benchmark_results.csv
+benchmark_results.metadata.json
+*.log
+.streamlit/secrets.toml

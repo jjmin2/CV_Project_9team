@@ -1,6 +1,5 @@
 streamlit
 opencv-python
 numpy
-# When the real PaDiM (pretrained ResNet18) is added:
-# torch
-# torchvision
+torch>=2.1
+torchvision>=0.16

@@ -20,9 +20,13 @@ STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
 class FeatureExtractor:
-    def __init__(self, train_pt_path):
+    def __init__(self, train_pt_path=None, *, idx=None):
         # 학습 특징 파일에 저장된 채널 번호(idx)를 그대로 사용해야 PaDiM 통계와 맞음
-        self.idx = torch.load(train_pt_path, map_location='cpu')['idx']
+        if idx is None:
+            if train_pt_path is None:
+                raise ValueError("학습 특징 경로 또는 채널 인덱스가 필요합니다.")
+            idx = torch.load(train_pt_path, map_location='cpu', weights_only=True, mmap=True)['idx']
+        self.idx = torch.as_tensor(idx, dtype=torch.int64).detach().cpu().clone()
 
         weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1
         self.model = torchvision.models.resnet18(weights=weights)

@@ -1,5 +1,9 @@
 """Evaluate PaDiM and Sobel on a whole MVTec AD category, following the protocol in the proposal.
 
+데이터 선택은 앱·노트북과 같은 splits/카테고리.json을 사용한다.
+최초 분할 이후에는 목록을 자동 재생성하거나 --max-normal로 줄이지 않는다.
+성능 지표 계산식은 기존 구현을 유지한다.
+
 Usage:
     python evaluate.py --category "D:\\mvtec\\bottle"
     python evaluate.py --category "D:\\mvtec\\bottle" --size 256 --seed 0 --out-dir evaluation_output
@@ -57,6 +61,7 @@ from common import (
     scan_mvtec,
 )
 from detectors import PaDiMDetector, SobelDetector
+from data_split import category_split, image_id, read_split_images, split_digest
 
 
 # --------------------------------------------------------------------------
@@ -97,17 +102,6 @@ def fmt(v, nd: int = 3) -> str:
 # --------------------------------------------------------------------------
 # Data: split of the normal images and the test items
 # --------------------------------------------------------------------------
-def split_normal(paths: list[str], val_fraction: float, seed: int, max_stats: int | None):
-    """Fixed random split of train/good into (statistics set, validation set)."""
-    order = np.random.default_rng(seed).permutation(len(paths))
-    n_val = min(max(1, int(round(len(paths) * val_fraction))), len(paths) - 1)
-    val = [paths[i] for i in sorted(order[:n_val])]
-    stats = [paths[i] for i in sorted(order[n_val:])]
-    if max_stats:
-        stats = stats[:max_stats]
-    return stats, val
-
-
 def read_resized(paths: list[str], size: int):
     imgs, ok = [], []
     for p in paths:
@@ -216,7 +210,8 @@ def compute_metrics(items, res, idx: list[int]) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Evaluate PaDiM and Sobel on one MVTec AD category.")
     ap.add_argument("--category", required=True, help="MVTec AD category folder (train/, test/, ground_truth/)")
-    ap.add_argument("--size", type=int, default=INPUT_SIZE, help="input resolution (default %(default)s)")
+    ap.add_argument("--split-file", default=None, help="공통 분할 파일, 생략 시 splits/카테고리.json")
+    ap.add_argument("--size", type=int, default=INPUT_SIZE, choices=[256], help="공통 입력 해상도")
     ap.add_argument("--seed", type=int, default=0, help="seed of the train/good split (default %(default)s)")
     ap.add_argument("--val-fraction", type=float, default=0.2, help="share of train/good kept for validation")
     ap.add_argument("--max-normal", type=int, default=None, help="cap on statistics images (default: all)")
@@ -254,12 +249,20 @@ def main() -> None:
     if not detectors:
         sys.exit("Nothing to evaluate: every method is still a placeholder.")
 
-    stats_paths, val_paths = split_normal(normal_paths, args.val_fraction, args.seed, args.max_normal)
-    stats_imgs, stats_ok = read_resized(stats_paths, args.size)
-    val_imgs, val_ok = read_resized(val_paths, args.size)
+    # 지표 계산은 유지하고 데이터 선택만 앱·노트북과 같은 최종 분할로 연결한다.
+    split = category_split(category, args.split_file, args.seed, args.val_fraction)
+    if args.max_normal is not None and args.max_normal < len(split["statistics_images"]):
+        sys.exit("최종 분할의 통계 이미지 수를 줄일 수 없습니다. --max-normal을 생략하세요.")
+    stats_imgs, stats_ok = read_split_images(category.root, split, "statistics_images", args.size)
+    val_imgs, val_ok = read_split_images(category.root, split, "validation_images", args.size)
+    allowed_test = set(split["test_images"])
+    category.test = {t: [p for p in paths if image_id(p) in allowed_test] for t, paths in category.test.items()}
+    category.test = {t: paths for t, paths in category.test.items() if paths}
     if not stats_imgs or not val_imgs:
         sys.exit("Could not read the normal images of the split.")
     items, missing_mask, unreadable = load_test_items(category, args.size, args.max_test_per_type)
+    if unreadable:
+        sys.exit("고정 테스트 목록에서 읽을 수 없는 이미지가 있습니다. 데이터를 확인하세요.")
     if not items:
         sys.exit("No readable test images.")
 
@@ -282,12 +285,8 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "split.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "category": os.path.basename(os.path.normpath(category.root)), "seed": args.seed,
-            "val_fraction": args.val_fraction, "size": args.size,
-            "statistics_images": [os.path.basename(p) for p in stats_ok],
-            "validation_images": [os.path.basename(p) for p in val_ok],
-        }, f, indent=1)
+        json.dump(split, f, ensure_ascii=False, indent=2)
+    print(f"공통 분할 ID: {split_digest(split)}")
 
     good_idx = [i for i, it in enumerate(items) if it["label"] == 0]
     summary_rows, per_image_rows = [], []

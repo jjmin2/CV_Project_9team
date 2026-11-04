@@ -91,16 +91,27 @@ class MethodResult:
     image_score: float
     is_defective: bool
     loc: Localization
-    ms: float  # scoring + postprocessing time; excludes file reading, resizing and drawing
+    ms: float  # 공통 전처리부터 점수·판정 계산과 후처리까지의 총 경과 시간
+    preprocess_ms: float
+    score_ms: float
+    postprocess_ms: float
+    input_image: np.ndarray
 
 
-def run_method(detector, img_bgr: np.ndarray, cfg: PostConfig, image_threshold: float) -> MethodResult:
+def run_method(detector, img_bgr: np.ndarray, cfg: PostConfig, image_threshold: float,
+               size: int = INPUT_SIZE) -> MethodResult:
+    """파일 디코딩이 끝난 원본부터 전처리·점수·후처리를 같은 범위로 측정한다."""
     t0 = time.perf_counter()
-    score_map = detector.score_map(img_bgr)
+    image = preprocess(img_bgr, size)
+    t1 = time.perf_counter()
+    score_map = detector.score_map(image)
+    image_score = float(score_map.max())
+    is_defective = image_score >= image_threshold
+    t2 = time.perf_counter()
     loc = postprocess(score_map, cfg)
-    ms = (time.perf_counter() - t0) * 1000.0
-    image_score = float(score_map.max())  # image score = maximum value of the score map
-    return MethodResult(score_map, image_score, image_score >= image_threshold, loc, ms)
+    t3 = time.perf_counter()
+    return MethodResult(score_map, image_score, is_defective, loc, (t3 - t0) * 1000,
+                        (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000, image)
 
 
 # --------------------------------------------------------------------------
@@ -200,7 +211,8 @@ def stats_signature(paths: list[str], size: int, tag: str = "") -> str:
     h.update(f"{CACHE_VERSION}|{tag}|{size}|{len(paths)}".encode())
     for p in paths:
         st = os.stat(p)
-        h.update(f"|{os.path.basename(p)}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8", "surrogatepass"))
+        # 같은 이름·크기·수정 시간을 가진 다른 카테고리의 캐시 충돌을 방지한다.
+        h.update(f"|{os.path.abspath(p)}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8", "surrogatepass"))
     return h.hexdigest()[:16]
 
 

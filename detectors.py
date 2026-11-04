@@ -24,6 +24,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from padim import PaDiMDetector  # 실제 ResNet18 기반 PaDiM을 공통 인터페이스로 제공한다.
+
 from sobel_detector import SobelDetector as TeamSobelDetector  # team module, source: branch sobel-module
 
 
@@ -170,42 +172,3 @@ class SobelDetector:
             g = self.core.gradients(rgb)[2]
             s = g / (float(g.std()) + self.core.config.epsilon)
         return s.astype(np.float32)
-
-
-# ==========================================================================
-# PaDiM: PLACEHOLDER, to be replaced with the real implementation
-# ==========================================================================
-class PaDiMDetector:
-    """TODO (owners of the ResNet18 feature extractor and of PaDiM):
-
-    fit():       extract ResNet18 features (intermediate layers, dimensionality reduced) from the
-                 normal images; estimate the mean and the regularized covariance at every
-                 spatial position.
-    score_map(): extract features from the test image, compute the Mahalanobis distance at every
-                 position, and resize the result to (H, W) of the input image.
-    save()/load(): optional; see the statistics cache note at the top of this file, then set
-                 supports_cache = True.
-
-    For now it returns an all-zero map so the UI runs end to end; it has no detection meaning yet.
-    """
-
-    name = "PaDiM"
-    score_range = 50.0        # TODO: set from the real Mahalanobis distance distribution
-    default_threshold = 20.0  # TODO: fix with the normal validation images
-    is_placeholder = True
-    supports_cache = False    # TODO: set True once save()/load() below are implemented
-    cache_version = "1"
-
-    def fit(self, normal_images: list[np.ndarray]) -> None:
-        pass  # TODO
-
-    def save(self, path: str) -> None:
-        # TODO: np.savez(path, mean=..., inv_cov=...) with the per-position mean and inverse covariance.
-        raise NotImplementedError
-
-    def load(self, path: str) -> None:
-        # TODO: restore the arrays saved above, then set supports_cache = True on this class.
-        raise NotImplementedError
-
-    def score_map(self, img_bgr: np.ndarray) -> np.ndarray:
-        return np.zeros(img_bgr.shape[:2], dtype=np.float32)  # TODO

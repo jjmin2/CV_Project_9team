@@ -1,180 +1,126 @@
-"""CPU timing benchmark for DefectVision: batch size 1, repeated runs after warm-up.
+"""동일 CPU에서 전처리부터 후처리까지 배치 1의 반복 경과 시간을 측정한다.
 
-Usage:
-    python benchmark.py --category "D:\\mvtec\\bottle"
-    python benchmark.py --category "D:\\mvtec\\bottle" --size 256 --n-images 6 --warmup 5 --repeats 30
-
-Each stage is measured separately, as the proposal requires (milliseconds per image unless noted):
-  statistics estimation (s)   one-off fit on the normal images (always a fresh fit; the cache is not used)
-  file read                   reading one image file from disk (one read per image; the OS cache may apply)
-  resize                      resizing to the common input size
-  score                       detector.score_map(): feature extraction / gradients and scoring
-  postprocess                 OpenCV postprocessing: blur, threshold, morphology, connected components, contours
-  total = score + postprocess this is what the app shows as "CPU time"
-  render                      OpenCV drawing for display only (heatmap, contours, mask); Streamlit and
-                              browser rendering time are NOT included
-
-Settings used: default postprocessing parameters. Run it on the same machine and with the same
---size / --threads for both methods. Results are written to a CSV file (default benchmark_results.csv).
+실행: python benchmark.py --category D:/mvtec/bottle --threads 2
+통계 준비·임계값 보정·파일 읽기·OpenCV 그림 생성은 총 추론 시간에서 제외해 별도 기록한다.
+실제 성능 비교는 사용자가 준비한 원본 데이터로 별도 수행한다.
 """
-from __future__ import annotations
 
 import argparse
 import csv
-import os
+import json
+from pathlib import Path
 import platform
 import statistics
-import sys
 import time
 
 import cv2
 import numpy as np
+import torch
 
-from common import (
-    INPUT_SIZE,
-    PostConfig,
-    clean_path,
-    draw_contours,
-    heatmap_overlay,
-    load_normal_images,
-    mask_to_image,
-    postprocess,
-    preprocess,
-    read_bgr,
-    scan_mvtec,
-)
+from common import PostConfig, draw_contours, heatmap_overlay, mask_to_image, read_bgr, run_method, scan_mvtec
+from data_split import category_split, read_split_images, split_digest
 from detectors import PaDiMDetector, SobelDetector
+from padim_preview import calibrate_maps
 
 
-def ms(t0: float, t1: float) -> float:
-    return (t1 - t0) * 1000.0
+def summarize(values):
+    return {"mean": statistics.fmean(values), "median": statistics.median(values),
+            "std": statistics.pstdev(values), "min": min(values), "max": max(values), "n": len(values)}
 
 
-def summarize(values: list[float]) -> dict:
-    return {
-        "mean": statistics.fmean(values),
-        "median": statistics.median(values),
-        "std": statistics.pstdev(values),
-        "min": min(values),
-        "max": max(values),
-        "n": len(values),
-    }
+def measure_runs(detector, raw, cfg, image_threshold, size=256, warmup=5, repeats=30):
+    """리사이즈도 매번 실행하고, 공통 실행 함수가 반환한 단계별 시간을 모은다."""
+    if warmup < 0 or repeats < 1:
+        raise ValueError("워밍업은 0 이상, 반복 횟수는 1 이상이어야 합니다.")
+    records = {key: [] for key in ("preprocess (ms)", "score (ms)", "postprocess (ms)",
+                                   "total = preprocess + score + postprocess (ms)",
+                                   "render, OpenCV drawing only (ms)")}
+    for i in range(warmup + repeats):
+        result = run_method(detector, raw, cfg, image_threshold, size)
+        start = time.perf_counter()
+        heatmap_overlay(result.input_image, result.score_map, max(2 * cfg.threshold, 1e-6))
+        draw_contours(result.input_image, result.loc.contours)
+        mask_to_image(result.loc.mask)
+        render_ms = (time.perf_counter() - start) * 1000
+        if i >= warmup:
+            for key, value in zip(records, (result.preprocess_ms, result.score_ms, result.postprocess_ms, result.ms, render_ms)):
+                records[key].append(value)
+    return records
 
 
-def pick_test_images(category, n: int) -> list[str]:
-    """n test images spread evenly over the whole test set (normal and defective)."""
-    items = [p for paths in category.test.values() for p in paths]
-    if n >= len(items):
-        return items
-    idx = np.unique(np.linspace(0, len(items) - 1, n).round().astype(int))
-    return [items[i] for i in idx]
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="CPU timing benchmark for PaDiM vs Sobel.")
-    ap.add_argument("--category", required=True, help="MVTec AD category folder (contains train/ and test/)")
-    ap.add_argument("--size", type=int, default=INPUT_SIZE, help="input resolution (default %(default)s)")
-    ap.add_argument("--max-normal", type=int, default=100, help="max normal images for the statistics")
-    ap.add_argument("--n-images", type=int, default=6, help="number of test images to time")
-    ap.add_argument("--warmup", type=int, default=5, help="warm-up runs per image and method (not counted)")
-    ap.add_argument("--repeats", type=int, default=30, help="timed runs per image and method")
-    ap.add_argument("--threads", type=int, default=None, help="OpenCV thread count (default: OpenCV's own)")
-    ap.add_argument("--out", default="benchmark_results.csv", help="CSV output file")
-    args = ap.parse_args()
-    if args.warmup < 0 or args.repeats < 1 or args.n_images < 1:
-        sys.exit("--warmup must be >= 0, --repeats and --n-images must be >= 1")
-
-    if args.threads is not None:
-        cv2.setNumThreads(args.threads)
-
-    category = scan_mvtec(clean_path(args.category))
+def main():
+    parser = argparse.ArgumentParser(description="전처리~후처리 공통 CPU 측정")
+    parser.add_argument("--category", required=True, help="원본 MVTec 카테고리 폴더")
+    parser.add_argument("--split-file", default=None, help="공통 분할 파일, 생략 시 splits/카테고리.json")
+    parser.add_argument("--size", type=int, default=256, choices=[256], help="공통 입력 크기")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--max-normal", type=int, default=None, help="기존 호환용: 고정 통계 목록을 줄일 수 없습니다")
+    parser.add_argument("--n-images", type=int, default=6)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--threads", type=int, default=2, help="OpenCV와 PyTorch에 공통 적용")
+    parser.add_argument("--out", default="benchmark_results.csv")
+    args = parser.parse_args()
+    if args.warmup < 0 or min(args.repeats, args.n_images, args.threads) < 1:
+        parser.error("반복 횟수·이미지 수·스레드는 1 이상, 워밍업은 0 이상이어야 합니다.")
+    cv2.setNumThreads(args.threads)
+    torch.set_num_threads(args.threads)
+    category = scan_mvtec(args.category)
     if category is None:
-        sys.exit(f"Not an MVTec AD category folder (expected test/<type>/ with images): {args.category}")
-    if not category.train_good:
-        sys.exit("The category folder has no train/good folder to estimate normal statistics from.")
-
-    print(f"Python {platform.python_version()} | OpenCV {cv2.__version__} | NumPy {np.__version__}")
-    print(f"CPU: {platform.processor() or platform.machine()} | logical cores: {os.cpu_count()} "
-          f"| OpenCV threads: {cv2.getNumThreads()}")
-    print(f"Input size {args.size} | warm-up {args.warmup} | timed repeats {args.repeats} | batch size 1")
-
-    imgs, used = load_normal_images(category.train_good, args.size, args.max_normal)
-    if not imgs:
-        sys.exit("No readable images in train/good.")
-    test_paths = pick_test_images(category, args.n_images)
-    print(f"{len(imgs)} normal images for statistics, {len(test_paths)} test images timed\n")
-
-    detectors = [PaDiMDetector(), SobelDetector()]
-    cfg = PostConfig()
-
-    # 1) one-off statistics estimation (always a fresh fit)
-    fit_s = {}
-    for d in detectors:
-        t0 = time.perf_counter()
-        d.fit(imgs)
-        fit_s[d.name] = time.perf_counter() - t0
-
-    # 2) per-image timing
-    shared = {"file read (ms)": [], "resize (ms)": []}
-    per = {d.name: {"score (ms)": [], "postprocess (ms)": [], "total = score + postprocess (ms)": [],
-                    "render, OpenCV drawing only (ms)": []} for d in detectors}
+        parser.error("MVTec 카테고리 폴더를 확인하세요.")
+    split = category_split(category, args.split_file, args.seed, args.val_fraction)
+    if args.max_normal is not None and args.max_normal < len(split["statistics_images"]):
+        parser.error("최종 분할의 통계 이미지 수를 줄일 수 없습니다. --max-normal을 생략하세요.")
+    normal, _ = read_split_images(category.root, split, "statistics_images")
+    validation, _ = read_split_images(category.root, split, "validation_images")
+    paths = [str(Path(category.root) / p) for p in split["test_images"]]
+    if not paths:
+        parser.error("고정 분할에 테스트 이미지가 없습니다.")
+    ids = np.unique(np.linspace(0, len(paths) - 1, min(args.n_images, len(paths))).round().astype(int))
+    test_paths = [paths[i] for i in ids]
+    rows = []
+    detectors, settings = [PaDiMDetector(), SobelDetector()], {}
+    for det in detectors:
+        start = time.perf_counter()
+        det.fit(normal)
+        rows.append((det.name, "statistics preparation (s)", summarize([time.perf_counter() - start])))
+        start = time.perf_counter()
+        thresholds = calibrate_maps(det.score_map(image) for image in validation)
+        rows.append((det.name, "threshold calibration (s)", summarize([time.perf_counter() - start])))
+        settings[det.name] = (PostConfig(threshold=thresholds["pixel"]), thresholds["image"])
+    records = {det.name: {} for det in detectors}
+    reads = []
     for path in test_paths:
-        t0 = time.perf_counter()
+        start = time.perf_counter()
         raw = read_bgr(path)
-        t1 = time.perf_counter()
+        reads.append((time.perf_counter() - start) * 1000)
         if raw is None:
-            print(f"Skipping unreadable image: {path}")
-            continue
-        img = preprocess(raw, args.size)
-        t2 = time.perf_counter()
-        shared["file read (ms)"].append(ms(t0, t1))
-        shared["resize (ms)"].append(ms(t1, t2))
-
-        for d in detectors:
-            rec = per[d.name]
-            for i in range(args.warmup + args.repeats):
-                a = time.perf_counter()
-                score_map = d.score_map(img)
-                b = time.perf_counter()
-                loc = postprocess(score_map, cfg)
-                c = time.perf_counter()
-                heatmap_overlay(img, score_map, d.score_range)
-                draw_contours(img, loc.contours)
-                mask_to_image(loc.mask)
-                e = time.perf_counter()
-                if i >= args.warmup:
-                    rec["score (ms)"].append(ms(a, b))
-                    rec["postprocess (ms)"].append(ms(b, c))
-                    rec["total = score + postprocess (ms)"].append(ms(a, c))
-                    rec["render, OpenCV drawing only (ms)"].append(ms(c, e))
-
-    # 3) report
-    rows = []  # (scope, metric, stats)
-    for d in detectors:
-        rows.append((d.name, "statistics estimation (s)", summarize([fit_s[d.name]])))
-    for metric, vals in shared.items():
-        if vals:
-            rows.append(("shared", metric, summarize(vals)))
-    for d in detectors:
-        for metric, vals in per[d.name].items():
-            if vals:
-                rows.append((d.name, metric, summarize(vals)))
-
-    print(f"{'Scope':<8} {'Metric':<36} {'mean':>9} {'median':>9} {'std':>9} {'min':>9} {'max':>9} {'n':>6}")
-    print("-" * 100)
-    for scope, metric, s in rows:
-        print(f"{scope:<8} {metric:<36} {s['mean']:9.3f} {s['median']:9.3f} {s['std']:9.3f} "
-              f"{s['min']:9.3f} {s['max']:9.3f} {s['n']:6d}")
-    for d in detectors:
-        if d.is_placeholder:
-            print(f"\nNote: {d.name} is still a placeholder, so its timings are NOT meaningful yet.")
-
-    with open(args.out, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["scope", "metric", "mean", "median", "std", "min", "max", "n"])
-        for scope, metric, s in rows:
-            w.writerow([scope, metric] + [round(s[k], 4) for k in ("mean", "median", "std", "min", "max")] + [s["n"]])
-    print(f"\nSaved: {os.path.abspath(args.out)}")
+            raise ValueError(f"고정 테스트 이미지를 읽을 수 없습니다: {path}")
+        for det in detectors:
+            cfg, threshold = settings[det.name]
+            result = measure_runs(det, raw, cfg, threshold, args.size, args.warmup, args.repeats)
+            for metric, values in result.items():
+                records[det.name].setdefault(metric, []).extend(values)
+    rows.append(("shared", "file read + decode (ms)", summarize(reads)))
+    for name, metrics in records.items():
+        rows.extend((name, metric, summarize(values)) for metric, values in metrics.items())
+    target = Path(args.out)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(["scope", "metric", "mean", "median", "std", "min", "max", "n"])
+        for name, metric, stats in rows:
+            writer.writerow([name, metric, *[stats[key] for key in ("mean", "median", "std", "min", "max", "n")]])
+            print(f"{name} | {metric} | 평균 {stats['mean']:.3f} | 중앙값 {stats['median']:.3f} | n={stats['n']}")
+    metadata = {"split_id": split_digest(split), "split": split, "test_images": [split["test_images"][i] for i in ids],
+                "python": platform.python_version(), "torch": torch.__version__, "opencv": cv2.__version__,
+                "cpu": platform.processor(), "torch_threads": torch.get_num_threads(), "opencv_threads": cv2.getNumThreads(),
+                "warmup": args.warmup, "repeats": args.repeats, "batch_size": 1, "image_size": args.size,
+                "total_scope": "공통 전처리 + 특징/엣지 및 점수·판정 계산 + 후처리",
+                "excluded": "통계 준비, 임계값 보정, 파일 읽기·디코딩, 화면 렌더링"}
+    target.with_suffix(".metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"분할 ID: {metadata['split_id']} · CSV 저장: {target}")
 
 
 if __name__ == "__main__":
