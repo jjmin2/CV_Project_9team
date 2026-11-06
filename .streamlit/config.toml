@@ -8,3 +8,7 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# 최초 실행의 이메일 입력을 건너뛰고 바로 서버를 시작한다.
+headless = true

@@ -10,10 +10,15 @@
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m streamlit run app.py
+.\.venv\Scripts\python.exe run.py
 ```
 
 [앱 열기](http://localhost:8501)
+
+가상환경을 활성화했다면 `python run.py`로 실행합니다.
+터미널에는 `Welcome to Streamlit!`만 표시하고 이메일 입력 없이 서버를 시작합니다.
+서버가 시작된 뒤 위 링크로 접속하며, 사용하는 동안 터미널을 열어두세요.
+기존 `python -m streamlit run app.py`도 이메일 입력 없이 실행되지만 기본 접속 안내는 표시됩니다.
 
 ## 사용자 흐름
 
